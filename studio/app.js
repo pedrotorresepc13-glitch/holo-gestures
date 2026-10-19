@@ -1,5 +1,6 @@
 import * as THREE from '../vendor/three.module.js';
 import {areas, helpText} from './demo.js';
+import {createGestureEngine} from './gesture-engine.js';
 
 // Prototipo frontend: sem tokens, endpoints externos ou dados empresariais reais.
 const $ = (s) => document.querySelector(s);
@@ -9,9 +10,9 @@ try { restored = JSON.parse(localStorage.getItem(key) || '{}') || {}; } catch {}
 const state = {
   area:'geral', company:typeof restored.company === 'string' ? restored.company : 'Empresa Exemplo',
   custom:restored.custom === true, voice:false, provider:restored.provider || 'demo',
-  model:null, stream:null, landmark:null, lastFrame:0, wasPinching:false,
-  gestureReady:0, scene:null, camera:null, renderer:null, group:null,
-  nodes:[], drag:null, rotY:0, rotX:0
+  model:null, stream:null, landmark:null, lastFrame:0, gestureEngine:null, gestureGrab:null,
+  scene:null, camera:null, renderer:null, group:null, baseCameraZ:12,
+  nodes:[], drag:null, rotY:0, rotX:0, rotZ:0, zoom:1
 };
 function save() {
   try { localStorage.setItem(key, JSON.stringify({company:state.company,custom:state.custom,provider:state.provider})); }
@@ -53,7 +54,7 @@ function selectArea(id, announce=false) {
   state.nodes.forEach(n=> {
     const active=n.id===a.id;
     n.mesh.material.emissiveIntensity=active?1.1:0.36;
-    n.mesh.scale.setScalar(active?1.27:1);
+    n.mesh.scale.setScalar((active?1.27:1)*(n.userScale||1));
   });
   if(announce) respond(shown.summary);
 }
@@ -150,7 +151,7 @@ function setupNavigation() {
     } catch { respond('Não foi possível ativar a tela cheia neste navegador.');}
   });
   $('#btn-reset').addEventListener('click',()=>{
-    state.rotX=0;state.rotY=0;selectArea('geral',true);
+    resetScene(true);
   });
   $('#btn-mic').addEventListener('click',listen);
   $('#btn-tts').addEventListener('click',()=>{
@@ -159,6 +160,11 @@ function setupNavigation() {
     if(!state.voice&&window.speechSynthesis)speechSynthesis.cancel();
   });
   $('#btn-gestures').addEventListener('click',toggleGestures);
+  $('#btn-immersive').addEventListener('click',()=>{
+    const immersive=$('.app').classList.toggle('immersive');
+    $('#btn-immersive').setAttribute('aria-pressed',String(immersive));
+    $('#btn-immersive').textContent=immersive?'◩ Exibir painéis':'◌ Modo imersivo';
+  });
 }
 function openSettings(mode) {
   const host=$('#settings-content');host.replaceChildren();
@@ -219,25 +225,41 @@ function initScene() {
     const renderer=new THREE.WebGLRenderer({canvas,alpha:true,antialias:true,powerPreference:'high-performance'});
     renderer.setPixelRatio(Math.min(window.devicePixelRatio||1,2));
     const group=new THREE.Group();scene.add(group);
-    scene.add(new THREE.AmbientLight(0xffffff,.65));
-    const light=new THREE.PointLight(0x7dece1,25,30);light.position.set(2,5,6);scene.add(light);
+    scene.add(new THREE.AmbientLight(0xffffff,.7));
+    const light=new THREE.PointLight(0x7dece1,30,35);light.position.set(2,5,6);scene.add(light);
+    const backLight=new THREE.PointLight(0x6a90ff,16,32);
+    backLight.position.set(-5,-3,-4);scene.add(backLight);
     const count=180,verts=[];
     for(let i=0;i<count;i++)verts.push((Math.random()-.5)*24,(Math.random()-.5)*15,-5-Math.random()*12);
     const stars=new THREE.BufferGeometry();stars.setAttribute('position',new THREE.Float32BufferAttribute(verts,3));
     scene.add(new THREE.Points(stars,new THREE.PointsMaterial({color:0x478ca3,size:.028,transparent:true,opacity:.55})));
     areas.forEach((a,i)=>{
       const angle=i*Math.PI*2/areas.length-Math.PI/2;
-      const x=Math.cos(angle)*3.15,y=Math.sin(angle)*1.85,z=Math.sin(angle*2)*.3;
+      // Distribuicao espacial: areas em planos de profundidade distintos, nao coladas numa tela.
+      const depths=[.45,-.8,1.05,-.45,.7];
+      const x=Math.cos(angle)*3.15,y=Math.sin(angle)*1.85,z=depths[i%depths.length];
       const geometry=new THREE.IcosahedronGeometry(.63,2);
       const mesh=new THREE.Mesh(geometry,new THREE.MeshStandardMaterial({
         color:a.color,emissive:a.color,emissiveIntensity:.37,roughness:.25,metalness:.28,flatShading:true
       }));
+      // Anel holografico faz parte do objeto, portanto acompanha pegada, giro e zoom.
+      const ring=new THREE.Mesh(
+        new THREE.TorusGeometry(.81,.012,8,72),
+        new THREE.MeshBasicMaterial({color:a.color,transparent:true,opacity:.56,depthWrite:false})
+      );
+      ring.rotation.x=Math.PI/3;
+      mesh.add(ring);
+      const core=new THREE.Mesh(
+        new THREE.OctahedronGeometry(.20,0),
+        new THREE.MeshBasicMaterial({color:0xe8fff5,transparent:true,opacity:.24,depthWrite:false})
+      );
+      mesh.add(core);
       mesh.position.set(x,y,z);group.add(mesh);
       const halo=new THREE.Mesh(new THREE.SphereGeometry(.86,24,16),
         new THREE.MeshBasicMaterial({color:a.color,transparent:true,opacity:.09,depthWrite:false}));
       halo.position.copy(mesh.position);group.add(halo);
       const name=labelSprite(a.name);name.position.set(x,y-.98,z);group.add(name);
-      state.nodes.push({id:a.id,mesh,halo,name});
+      state.nodes.push({id:a.id,mesh,halo,name,home:mesh.position.clone(),userScale:1});
     });
     const orbit=new THREE.Mesh(new THREE.TorusGeometry(3.28,.012,8,120),
       new THREE.MeshBasicMaterial({color:0x36789b,transparent:true,opacity:.32}));
@@ -246,7 +268,8 @@ function initScene() {
     function resize() {
       const bounds=host.getBoundingClientRect();
       const w=Math.max(1,bounds.width),h=Math.max(1,bounds.height);
-      camera.aspect=w/h;camera.position.z=w<500?16:w<800?14:12;
+      camera.aspect=w/h;state.baseCameraZ=w<500?16:w<800?14:12;
+      camera.position.z=state.baseCameraZ/state.zoom;
       camera.updateProjectionMatrix();renderer.setSize(w,h,false);
     }
     new ResizeObserver(resize).observe(host);resize();
@@ -281,8 +304,10 @@ function initScene() {
       requestAnimationFrame(frame);
       group.rotation.y=state.rotY+(reduce?0:Math.sin(t*.00013)*.07);
       group.rotation.x=state.rotX;
+      group.rotation.z=state.rotZ;
+      camera.position.z=state.baseCameraZ/state.zoom;
       state.nodes.forEach((n,i)=>{
-        n.halo.scale.setScalar(1+(reduce?0:Math.sin(t*.002+i)*.06));
+        n.halo.scale.setScalar((n.userScale||1)*(1+(reduce?0:Math.sin(t*.002+i)*.06)));
       });
       renderer.render(scene,camera);
     }requestAnimationFrame(frame);
@@ -319,11 +344,16 @@ async function toggleGestures() {
     await video.play();
     const mp=await import('../vendor/vision_bundle.mjs');
     const vision=await mp.FilesetResolver.forVisionTasks('/vendor/wasm');
-    const options=(delegate)=>({baseOptions:{modelAssetPath:'/vendor/hand_landmarker.task',delegate},runningMode:'VIDEO',numHands:1,minHandDetectionConfidence:.6,minTrackingConfidence:.6});
+    const options=(delegate)=>({baseOptions:{modelAssetPath:'/vendor/hand_landmarker.task',delegate},runningMode:'VIDEO',numHands:2,minHandDetectionConfidence:.6,minHandPresenceConfidence:.6,minTrackingConfidence:.6});
     try {state.landmark=await mp.HandLandmarker.createFromOptions(vision,options('GPU'));}
     catch {state.landmark=await mp.HandLandmarker.createFromOptions(vision,options('CPU'));}
+    state.gestureEngine=createGestureEngine({
+      bounds:()=>$('#scene-wrap').getBoundingClientRect(),
+      onStart:beginAirGesture,onMove:moveAirGesture,onEnd:endAirGesture,
+      onDouble:twoHandGesture,onPeace:()=>resetScene(true),onCursor:showGestureCursor
+    });
     $('#btn-gestures').textContent='✋ Desativar gestos';
-    setStatus('Gestos ativos: pinça para selecionar');
+    setStatus('Gestos: pinça para pegar · duas mãos para ampliar/girar · ✌ para restaurar');
     requestAnimationFrame(trackHands);
   }catch(err) {
     stopGestures();
@@ -335,7 +365,93 @@ function stopGestures() {
   if(state.stream){state.stream.getTracks().forEach(t=>t.stop());state.stream=null;}
   const video=$('#camera-feed');video.hidden=true;video.srcObject=null;
   $('#gesture-pointer').hidden=true;$('#btn-gestures').textContent='✋ Ativar gestos';
-  state.wasPinching=false;setStatus('Câmera desligada');
+  state.gestureEngine?.reset();state.gestureEngine=null;state.gestureGrab=null;
+  $('.app').classList.remove('is-grabbing');
+  setStatus('Câmera desligada');
+}
+// Acoes espaciais do mapa, acionadas pelo motor de gestos adaptado do original.
+function showGestureCursor(position,pinching) {
+  const cursor=$('#gesture-pointer');
+  cursor.hidden=!position;
+  if(!position)return;
+  cursor.style.left=position.x+'px';cursor.style.top=position.y+'px';
+  cursor.style.borderColor=pinching?'#ffd083':'#8cffc4';
+}
+function beginAirGesture(hand,point) {
+  if(state.gestureGrab)return;
+  const node=closestArea(point.x,point.y);
+  let offset={x:0,y:0};
+  if(node) {
+    const b=$('#scene-wrap').getBoundingClientRect(),p=node.mesh.getWorldPosition(new THREE.Vector3()).project(state.camera);
+    offset={x:(p.x+1)*b.width/2-point.x,y:(1-p.y)*b.height/2-point.y};
+  }
+  state.gestureGrab={hand,node,offset,previous:{...point}};
+  $('.app').classList.add('is-grabbing');
+}
+function moveAirGesture(hand,point) {
+  const grab=state.gestureGrab;
+  if(!grab||grab.hand!==hand)return;
+  const dx=point.x-grab.previous.x,dy=point.y-grab.previous.y;
+  if(Math.hypot(dx,dy)<2)return;
+  grab.previous={...point};
+  if(!grab.node) {
+    state.rotY+=dx*.005;
+    state.rotX=Math.max(-.5,Math.min(.5,state.rotX+dy*.003));
+    return;
+  }
+  // Projetar o dedo no plano 3D atual, sem deslocar subitamente o objeto ao pega-lo.
+  const node=grab.node,b=$('#scene-wrap').getBoundingClientRect();
+  const camera=state.camera,group=state.group;
+  camera.updateMatrixWorld(true);group.updateMatrixWorld(true);
+  const worldZ=node.mesh.getWorldPosition(new THREE.Vector3()).z;
+  const px=point.x+grab.offset.x,py=point.y+grab.offset.y;
+  const ray=new THREE.Vector3(2*px/b.width-1,1-2*py/b.height,.5).unproject(camera);
+  const direction=ray.sub(camera.position).normalize();
+  if(Math.abs(direction.z)<.001)return;
+  const depth=(worldZ-camera.position.z)/direction.z;
+  if(depth<=0)return;
+  const local=group.worldToLocal(camera.position.clone().addScaledVector(direction,depth));
+  if(!Number.isFinite(local.x)||!Number.isFinite(local.y))return;
+  node.mesh.position.set(Math.max(-4.5,Math.min(4.5,local.x)),Math.max(-3.2,Math.min(3.2,local.y)),local.z);
+  node.halo.position.copy(node.mesh.position);
+  node.name.position.copy(node.mesh.position);node.name.position.y-=.98;
+}
+function endAirGesture(hand,point,details) {
+  const grab=state.gestureGrab;
+  if(!grab||grab.hand!==hand)return;
+  if(!details.cancelled&&grab.node&&details.elapsed<450&&details.movement<60)selectArea(grab.node.id,true);
+  state.gestureGrab=null;
+  $('.app').classList.remove('is-grabbing');
+}
+function twoHandGesture({scale,rotation}) {
+  const grab=state.gestureGrab;
+  if(grab?.node) {
+    const node=grab.node;
+    node.userScale=Math.max(.55,Math.min(2.3,(node.userScale||1)*scale));
+    node.mesh.rotation.y+=rotation*1.6;
+    // Esticar aproxima no eixo Z; comprimir afasta. Outro objeto permanece em seu plano.
+    node.mesh.position.z=Math.max(-1.8,Math.min(2,node.mesh.position.z+(scale-1)*3));
+    node.halo.position.copy(node.mesh.position);
+    node.name.position.copy(node.mesh.position);node.name.position.y-=.98;
+    node.halo.scale.setScalar(node.userScale);
+    selectArea(state.area);
+  }else {
+    state.zoom=Math.max(.65,Math.min(1.85,state.zoom*scale));
+    state.rotZ=Math.max(-.75,Math.min(.75,state.rotZ+rotation));
+  }
+}
+function resetScene(announce=false) {
+  state.rotX=0;state.rotY=0;state.rotZ=0;state.zoom=1;
+  state.gestureGrab=null;
+  $('.app').classList.remove('is-grabbing');
+  for(const node of state.nodes) {
+    node.mesh.position.copy(node.home);
+    node.mesh.rotation.set(0,0,0);
+    node.halo.position.copy(node.home);node.halo.scale.setScalar(1);
+    node.name.position.copy(node.home);node.name.position.y-=.98;
+    node.userScale=1;
+  }
+  selectArea('geral',announce);
 }
 function trackHands(t) {
   if(!state.landmark||!state.stream)return;
@@ -343,24 +459,12 @@ function trackHands(t) {
     state.lastFrame=t;
     try {
       const result=state.landmark.detectForVideo($('#camera-feed'),t);
-      const hand=result.landmarks?.[0],cursor=$('#gesture-pointer');
-      if(hand) {
-        const finger=hand[8],thumb=hand[4];
-        const bounds=$('#scene-wrap').getBoundingClientRect();
-        const x=(1-finger.x)*bounds.width,y=finger.y*bounds.height;
-        cursor.hidden=false;cursor.style.left=x+'px';cursor.style.top=y+'px';
-        const pinching=Math.hypot(finger.x-thumb.x,finger.y-thumb.y)<.052;
-        cursor.style.borderColor=pinching?'#ffd083':'#8cffc4';
-        if(pinching&&!state.wasPinching&&t-state.gestureReady>1000) {
-          const n=closestArea(x,y);
-          if(n){selectArea(n.id,true);state.gestureReady=t;}
-        }
-        state.wasPinching=pinching;
-      }else{cursor.hidden=true;state.wasPinching=false;}
+      state.gestureEngine?.update(result.landmarks||[],t);
     }catch(err){console.warn('Falha no rastreamento',err);}
   }
   requestAnimationFrame(trackHands);
 }
+
 window.addEventListener('pagehide',stopGestures);
 setupNavigation();
 initScene();
