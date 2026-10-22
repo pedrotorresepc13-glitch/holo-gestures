@@ -16,9 +16,26 @@ jobs:
           node --input-type=module --check < studio/app.js
           node --input-type=module --check < studio/demo.js
           node --check services/assistant-server.mjs
+          node --check services/holo-companion.mjs
+          node --check services/holo-possebon.mjs
+          node --check services/holo-operational-intent.mjs
+          node --check services/holo-knowledge-answer.mjs
+          node --input-type=module --check < studio/brain-onboarding.js
+          node --input-type=module --check < studio/knowledge-dashboard.js
+          node --check tests/holo-possebon.test.mjs
+          node --input-type=module --check < studio/companion.js
+          node --check tests/companion.test.mjs
           node --check tests/gesture-engine.test.mjs
       - name: Testar gestos sintéticos (sem webcam)
         run: node tests/gesture-engine.test.mjs
+      - name: Testar a assistente local (sem Ollama, webcam ou dados reais)
+        run: node tests/companion.test.mjs
+      - name: Testar onboarding do POSSEBON Brain sem rede externa
+        run: node tests/holo-possebon.test.mjs
+      - name: Testar roteamento deterministico de metricas operacionais
+        run: node tests/holo-operational-intent.test.mjs
+      - name: Testar resumo real do conhecimento estudado
+        run: node tests/holo-knowledge-answer.test.mjs
       - name: Confirmar arquivos do deploy
         run: |
           test -s index.html
@@ -27,3 +44,31 @@ jobs:
           test -s vendor/vision_bundle.mjs
           test -s vendor/hand_landmarker.task
           python3 -m json.tool vercel.json >/dev/null
+
+  windows-installer-check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validar a sintaxe PowerShell sem instalar nada
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile('tools/Instalar-HOLO.ps1', [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
+          # Evita o bug real: function Winget -> chamada recursiva a winget.
+          $functions = @($tokens | Where-Object { $_.Kind -eq 'Identifier' })
+          $functionDefs = @([System.Management.Automation.Language.Parser]::ParseFile('tools/Instalar-HOLO.ps1', [ref]$null, [ref]$null).FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))
+          if ($functionDefs | Where-Object { $_.Name -ieq 'winget' }) {
+            throw 'Recursao: funcao Winget mascara winget.exe no PowerShell.'
+          }
+          $script = Get-Content tools/Instalar-HOLO.ps1 -Raw
+          if ($script -notmatch 'function Install-UsingWinget' -or -not $script.Contains('& winget.exe @args')) {
+            throw 'Instalador deve invocar winget.exe de forma explicita.'
+          }
+          if ($script -notmatch 'OLLAMA_MODELS' -or $script -notmatch 'HOLO_LOCAL_DATA_DIR' -or $script -notmatch 'D:\\HOLO') {
+            throw 'Configuracao de armazenamento no D: nao encontrada.'
+          }

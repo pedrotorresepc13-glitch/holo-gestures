@@ -1,5 +1,5 @@
 import * as THREE from '../vendor/three.module.js';
-import {areas, helpText} from './demo.js';
+import {areas} from './demo.js';
 import {createGestureEngine} from './gesture-engine.js';
 
 // Prototipo frontend: sem tokens, endpoints externos ou dados empresariais reais.
@@ -8,7 +8,8 @@ const key = 'holo-enterprise-prototipo-v1';
 let restored = {};
 try { restored = JSON.parse(localStorage.getItem(key) || '{}') || {}; } catch {}
 const state = {
-  area:'geral', company:typeof restored.company === 'string' ? restored.company : 'Empresa Exemplo',
+  area:'geral', overview:null, connected:false, enterpriseUnit:null,
+  company:typeof restored.company === 'string' ? restored.company : 'Empresa Exemplo',
   custom:restored.custom === true, voice:false, provider:restored.provider || 'demo',
   model:null, stream:null, landmark:null, lastFrame:0, gestureEngine:null, gestureGrab:null,
   scene:null, camera:null, renderer:null, group:null, baseCameraZ:12,
@@ -22,29 +23,60 @@ function setStatus(t) { $('#camera-status').textContent=t; }
 function text(tag, value, cls) {
   const e=document.createElement(tag); if(cls)e.className=cls; e.textContent=value; return e;
 }
-function formatArea(a) { return state.custom ? {
-  ...a,description:'Empresa criada localmente. Nenhuma fonte de dados está conectada.',
-  stats:[['Fonte de dados','Pendente'],['Indicadores','0'],['IA','Não conectada'],['Conexões','0']],
-  bars:[],summary:'Sua empresa ainda não possui dados. Configure conexões de forma segura no backend antes de consultar informações reais.'
-} : a; }
+function formatArea(a) {
+  const overview=state.overview;
+  if(overview?.ready){
+    const group=overview.areas?.[a.id]||{count:0,namespaces:{},examples:[]};
+    const bars=Object.entries(group.namespaces||{})
+      .filter(([_,v])=>Number(v)>0).sort((a,b)=>b[1]-a[1]).slice(0,7);
+    const activeMetric=(a.id==='pessoas'||a.id==='geral') && overview.operational &&
+      overview.operational.unit_id===overview.unit_id?overview.operational:null;
+    return {...a,
+      description:'Conhecimento catalogado sobre '+a.name+' na unidade '+(state.enterpriseUnit||overview.unit_id)+
+        '. Itens do Brain são metadados, não registros operacionais. Indicadores identificados como validados vêm de consulta específica.',
+      stats:[['Itens associados',String(group.count||0)],['Total no Brain',String(overview.total||0)],
+        ['Categorias',String(Object.keys(group.namespaces||{}).length)],
+        activeMetric?['Colaboradores ativos · consulta real',activeMetric.pessoas_ativas.toLocaleString('pt-BR')]:
+          ['Indicadores operacionais','Sem consulta']],
+      bars,examples:group.examples||[],
+      summary:'Fontes reais do Brain disponíveis para consulta.'
+    };
+  }
+  return state.custom?{
+    ...a,description:'Aguardando conexão ao Brain. Os indicadores operacionais não foram autorizados.',
+    stats:[['Brain','Não conectado'],['Indicadores','Sem fonte'],['IA','Local'],['Conexões','0']],
+    bars:[],examples:[],summary:'Conecte o POSSEBON para iniciar o estudo do Brain.'
+  }:a;
+}
 function selectArea(id, announce=false) {
+  const previous=state.area;
   const a=areas.find(x=>x.id===id) || areas[0]; state.area=a.id;
   const shown=formatArea(a);
   $('#selected-title').textContent=a.name;
   $('#selected-description').textContent=shown.description;
-  $('#scene-title').textContent=a.id==='geral'?'Sua empresa em outra dimensão.':'Explorando '+a.name.toLowerCase()+'.';
+  $('#scene-title').textContent=a.id==='geral'?'Explore o conhecimento da sua empresa.':'Área de '+a.name.toLowerCase()+'.';
   const metrics=$('#metrics');metrics.replaceChildren();
   for(const [name,value] of shown.stats) {
     const card=text('div','', 'metric'); card.append(text('strong',value), text('small',name));metrics.append(card);
   }
+  $('#chart-label').textContent=state.overview?.ready?'FONTES CATALOGADAS NO BRAIN':'DISTRIBUIÇÃO DEMONSTRATIVA';
   const bars=$('#bars');bars.replaceChildren();
-  if(!shown.bars.length) bars.append(text('p','Nenhum indicador disponível.','disclaimer'));
+  if(!shown.bars.length) bars.append(text('p',state.overview?.ready?'Nenhuma fonte identificada nesta área.':'Ainda não há indicadores conectados.','disclaimer'));
   else {
     const max=Math.max(1,...shown.bars.map(x=>x[1]));
     for(const [label,value] of shown.bars) {
       const row=text('div','','bar-row');const rail=text('div','','bar-rail');
       const fill=text('div','','bar-fill');fill.style.width=Math.max(4,(value/max)*100)+'%';
       rail.append(fill);row.append(text('span',label),rail,text('b',String(value)));bars.append(row);
+    }
+  }
+  const examples=$('#brain-examples');examples.replaceChildren();
+  if(state.overview?.ready && shown.examples?.length){
+    examples.append(text('div','FONTES RELACIONADAS','section-label'));
+    for(const item of shown.examples){
+      const el=text('div','','knowledge-example');
+      el.append(text('strong',item.title),text('small',item.namespace+' · '+(item.source||'Fonte Brain')));
+      examples.append(el);
     }
   }
   for(const b of document.querySelectorAll('.area-button')) {
@@ -56,66 +88,25 @@ function selectArea(id, announce=false) {
     n.mesh.material.emissiveIntensity=active?1.1:0.36;
     n.mesh.scale.setScalar((active?1.27:1)*(n.userScale||1));
   });
-  if(announce) respond(shown.summary);
+  // Gestos e cliques repetidos não devem inundar a conversa com avisos iguais.
+  // No modo de empresa sem conexões, a seleção apenas atualiza a interface.
+  // Não emitir o mesmo aviso a cada gesto; pedidos no chat têm resposta própria.
+  if(announce && previous!==a.id && !state.custom && !state.overview?.ready) respond(shown.summary);
+  window.dispatchEvent(new CustomEvent('holo:area-changed',{detail:{id:a.id}}));
 }
 function respond(value) {
-  const log=$('#assistant-log'); log.append(text('p',value,'ai-message'));log.scrollTop=log.scrollHeight;
-  if(state.voice && window.speechSynthesis) {
-    const u=new SpeechSynthesisUtterance(value);u.lang='pt-BR';u.rate=1;
-    const match=speechSynthesis.getVoices().find(v=>v.lang.toLowerCase()==='pt-br');
-    if(match)u.voice=match;
-    speechSynthesis.cancel();speechSynthesis.speak(u);
-  }
-}
-function ask(question) {
-  const input=question.trim();if(!input)return;
-  const log=$('#assistant-log'); log.append(text('p',input,'user-message'));log.scrollTop=log.scrollHeight;
-  if(state.provider!=='demo') { void askModel(input); return; }
-  const q=input.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
-  const destinations={
-    pessoas:['pessoa','colaborador','equipe','rh','treinamento','funcionario'],
-    compras:['compra','material','fornecedor','solicitacao','suprimento'],
-    seguranca:['seguranca','inspecao','auditoria','acidente','plano de acao','ronda'],
-    operacoes:['operacao','projeto','atividade','obra','producao'],
-    geral:['visao geral','painel geral','inicio','tudo','panorama']
-  };
-  if(q.includes('apresenta') || q.includes('tela cheia') || q.includes('telao')) {
-    respond('Você pode entrar no modo de apresentação pelo botão Apresentar. Nesse modo os indicadores seguem sendo apenas demonstrativos.');
-    return;
-  }
-  if(q.includes('ajuda')||q.includes('comando')){respond(helpText);return;}
-  if(q.includes('modelo')||q.includes('conectar ia')){openSettings('ia');respond('Configure o tipo de modelo no painel. As opções local e API ainda precisam de um serviço backend para responder.');return;}
-  const id=Object.keys(destinations).find(k=>destinations[k].some(w=>q.includes(w)));
-  if(id) {selectArea(id);respond(formatArea(areas.find(a=>a.id===id)).summary);return;}
-  if(q.includes('resumo')||q.includes('relatorio')) {
-    respond(state.custom?'Esta empresa ainda não possui fontes de dados autorizadas. Não posso produzir um relatório real.':'Resumo ilustrativo: 128 pessoas, 42 solicitações de compras, 11 planos de segurança e 8 projetos. Todos os números são inventados para o protótipo.');
-    return;
-  }
-  respond('Esta primeira versão utiliza comandos de demonstração, não um modelo de IA. '+helpText);
-}
-async function askModel(prompt) {
-  if(!['localhost','127.0.0.1'].includes(location.hostname)) {
-    respond('O modelo local ou por API exige um serviço backend autenticado. Nesta prévia pública ele ainda não está disponível. Use Demonstração.');
-    return;
-  }
-  respond('Consultando o provedor configurado no serviço local. Nenhuma fonte empresarial está conectada.');
-  try {
-    const reply=await fetch('http://127.0.0.1:4892/api/assist',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({prompt:prompt,area:state.area,provider:state.provider}),
-      signal:AbortSignal.timeout(50000)
-    });
-    const data=await reply.json();
-    if(!reply.ok)throw new Error(data.error||('HTTP '+reply.status));
-    respond(data.answer);
-  } catch(err) {
-    respond('Não foi possível consultar o modelo: '+String(err?.message||'Falha de comunicação')+'. Inicie o serviço local e confira a configuração.');
-  }
+  // Comunicação interna do mapa com o ÚNICO chat da HOLO.
+  window.dispatchEvent(new CustomEvent('holo:assistant-notice',{detail:{message:String(value)}}));
 }
 function updateCompany() {
-  $('#company-name').textContent=state.company;
-  $('#company-type').textContent=state.custom?'Empresa local sem conexões':'Ambiente de demonstração';
-  $('#data-badge').textContent=state.custom?'SEM FONTE DE DADOS':'DADOS FICTÍCIOS';
+  const connected=state.overview?.ready;
+  const company=connected&&state.company==='Empresa Exemplo'?'POSSEBON':state.company;
+  $('#company-name').textContent=company;
+  $('#company-type').textContent=connected?'POSSEBON Brain · Unidade '+state.enterpriseUnit:
+    state.custom?'Empresa local sem fontes':'Ambiente de demonstração';
+  $('#data-badge').textContent=connected?'BRAIN · '+state.overview.total+' ITENS':
+    state.custom?'SEM FONTE OPERACIONAL':'DADOS DEMONSTRATIVOS';
+  $('#data-badge').classList.toggle('brain-ready',!!connected);
   selectArea(state.area);
 }
 function setupNavigation() {
@@ -127,8 +118,15 @@ function setupNavigation() {
     b.addEventListener('click',()=>selectArea(a.id,true));nav.append(b);
   }
   updateCompany();
-  $('#command-form').addEventListener('submit',ev=>{
-    ev.preventDefault();ask($('#command-input').value);$('#command-input').value='';
+  window.addEventListener('holo:knowledge-updated',ev=>{
+    state.overview=ev.detail?.overview?.ready?ev.detail.overview:null;
+    state.connected=!!ev.detail?.connected;
+    state.enterpriseUnit=ev.detail?.unit_id||null;
+    updateCompany();
+  });
+  // O chat único controla o mesmo mapa 3D.
+  window.addEventListener('holo:navigate-area',event=>{
+    if(areas.some(a=>a.id===event.detail?.id))selectArea(event.detail.id,false);
   });
   $('#btn-company').addEventListener('click',()=>$('#modal-company').showModal());
   $('#company-form').addEventListener('submit',ev=>{
@@ -153,12 +151,6 @@ function setupNavigation() {
   $('#btn-reset').addEventListener('click',()=>{
     resetScene(true);
   });
-  $('#btn-mic').addEventListener('click',listen);
-  $('#btn-tts').addEventListener('click',()=>{
-    state.voice=!state.voice;$('#btn-tts').textContent=state.voice?'🔊 Voz ligada':'🔈 Voz desligada';
-    $('#btn-tts').setAttribute('aria-pressed',String(state.voice));
-    if(!state.voice&&window.speechSynthesis)speechSynthesis.cancel();
-  });
   $('#btn-gestures').addEventListener('click',toggleGestures);
   $('#btn-immersive').addEventListener('click',()=>{
     const immersive=$('.app').classList.toggle('immersive');
@@ -181,11 +173,11 @@ function openSettings(mode) {
     }
   } else {
     $('#modal-settings-title').textContent='Motor de inteligência híbrida';
-    $('#settings-description').textContent='Você escolhe o provedor, mas o backend ainda não está conectado. Nenhuma pergunta é enviada a modelos externos nesta versão.';
+    $('#settings-description').textContent='Modelo local e API externa usam o serviço HOLO Companion, quando configurado. A opção API externa exige autorização e chave no servidor. Os dados empresariais não são conectados automaticamente.';
     for(const [value,title,detail] of [
-      ['demo','Demonstração (ativa)','Regras locais, respostas reproduzíveis, sem modelo de IA.'],
-      ['local','Modelo aberto / local','Planejado para Ollama ou servidor compatível, via backend protegido.'],
-      ['api','API de IA externa','Planejado para provedores com chave mantida apenas no servidor.']
+      ['demo','Demonstração','Regras locais, respostas reproduzíveis, sem modelo de IA.'],
+      ['local','Modelo aberto / local','Usa o Ollama do seu computador através do HOLO Companion (porta 4891).'],
+      ['api','API de IA externa','Disponível apenas se o servidor estiver configurado com chave e autorização.']
     ]) {
       const c=document.createElement('button');c.className='settings-choice wide';
       c.textContent=(state.provider===value?'✓ ':'')+title;
@@ -193,19 +185,9 @@ function openSettings(mode) {
         state.provider=value;save();openSettings('ia');
       });host.append(c);
     }
-    host.append(text('p','Provedor selecionado: '+state.provider+'. Conexão operacional: somente demonstração.','disclaimer'));
+    host.append(text('p','Provedor selecionado: '+state.provider+'. Dados empresariais reais: ainda requerem fonte autorizada.','disclaimer'));
   }
   if(!$('#modal-settings').open) $('#modal-settings').showModal();
-}
-function listen() {
-  const Speech=window.SpeechRecognition||window.webkitSpeechRecognition;
-  if(!Speech){respond('Reconhecimento de voz indisponível neste navegador. Use o campo de texto.');return;}
-  const rec=new Speech();rec.lang='pt-BR';rec.interimResults=false;rec.maxAlternatives=1;
-  $('#btn-mic').textContent='🎙 Ouvindo…';
-  rec.onresult=e=>{const spoken=e.results[0][0].transcript;ask(spoken);};
-  rec.onerror=e=>respond('Não foi possível reconhecer a fala ('+e.error+').');
-  rec.onend=()=>{$('#btn-mic').textContent='🎙 Falar';};
-  try{rec.start();}catch{respond('Não foi possível iniciar o microfone.');}
 }
 function labelSprite(label) {
   const c=document.createElement('canvas');c.width=512;c.height=96;
