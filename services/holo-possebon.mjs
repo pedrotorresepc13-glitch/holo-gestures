@@ -30,8 +30,11 @@ export function createHoloPossebon({localDir,fetchImpl=fetch}){
 
   function publicStatus(){
     if(session && Date.now()>=session.expiresAt && !task)clearSession();
-    return {ok:true,connected:!!session,unit_id:session?.unitId||null,user_name:session?.userName||null,
-      expires_at:session?.expiresAt||null,remote,progress:{...progress},knowledge:{...cached}};
+    return {ok:true,connected:!!session,unit_id:session?.unitId||null,user_id:session?.userId||null,user_name:session?.userName||null,
+      can_manage_ai:session?.canManageAI===true,
+      expires_at:session?.expiresAt||null,remote,progress:{...progress},
+      knowledge:session?.canManageAI===true?{...cached}:
+        {ready:false,count:0,unitId:null,userId:null,completedAt:null,byNamespace:{}}};
   }
   function clearSession(){
     session=null;
@@ -85,13 +88,16 @@ export function createHoloPossebon({localDir,fetchImpl=fetch}){
     // Em memória APENAS. NÃO gravar JWT, login ou senha em JSON/arquivos.
     session={token:response.access_token,unitId:Number(response.unit_id),
       userId:parseUserId(response.access_token),userName:short(response.user_name,160),
+      // Exclusivamente permissão afirmativa emitida pela API POSSEBON autenticada.
+      canManageAI:response.can_manage_ai===true,
       expiresAt:Date.now()+Math.max(1,Number(response.expires_in||1800))*1000};
     if(!session.userId){clearSession();throw Error('Sessão recebida sem identificação de usuário.');}
     await mkdir(folder,{recursive:true,mode:0o700});
     await loadExisting();
     progress={running:false,done:false,phase:'conectado',count:cached.count,expected:0,namespace:'',error:null};
-    return {ok:true,connected:true,unit_id:session.unitId,user_name:session.userName,expires_at:session.expiresAt,
-      knowledge:{...cached}};
+    return {ok:true,connected:true,unit_id:session.unitId,user_name:session.userName,can_manage_ai:session.canManageAI===true,expires_at:session.expiresAt,
+      knowledge:session.canManageAI===true?{...cached}:
+        {ready:false,count:0,unitId:null,userId:null,completedAt:null,byNamespace:{}}};
   }
   // Decodifica somente o ID para nomear o cache. A autenticação real é verificada no servidor POSSEBON.
   function parseUserId(token){
@@ -104,7 +110,7 @@ export function createHoloPossebon({localDir,fetchImpl=fetch}){
     return session;
   }
   async function doStudy(){
-    const current=checkSession();
+    const current=requireAdmin();
     const clientKey=key();
     const temporary=path.join(folder,clientKey+'.building.jsonl');
     const final=cachePath();
@@ -163,15 +169,23 @@ export function createHoloPossebon({localDir,fetchImpl=fetch}){
       if(!completed)await rm(temporary,{force:true}).catch(()=>{});
     }finally{progress.running=false;task=null;}
   }
+  function requireAdmin(){
+    const session=checkSession();
+    if(session.canManageAI!==true){
+      const err=new Error('Acesso administrativo ao POSSEBON Brain não autorizado.');
+      err.httpStatus=403;throw err;
+    }
+    return session;
+  }
   async function startStudy(){
-    checkSession();
+    requireAdmin();
     if(task)return {ok:true,started:false,progress:{...progress}};
     progress={running:true,done:false,phase:'iniciando',count:0,expected:0,namespace:'',error:null};
     task=doStudy();
     return {ok:true,started:true,progress:{...progress}};
   }
   async function findEvidence(question){
-    if(!session||!cached.ready||Date.now()>=session.expiresAt)return [];
+    if(!session||session.canManageAI!==true||!cached.ready||Date.now()>=session.expiresAt)return [];
     const normalized=short(question,1200).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
     const summaryQuery=/(o que (voce )?(aprendeu|conhece|estudou)|resum[ao]|quais regras|conhecimento (do|sobre)|sobre (o )?possebon)/.test(normalized);
     const words=[...new Set(normalized.match(/[a-z0-9_]{4,}/g)||[])].filter(w=>!new Set([
@@ -199,7 +213,7 @@ export function createHoloPossebon({localDir,fetchImpl=fetch}){
 
   // Visão baseada SOMENTE nos títulos/fontes do Brain, nunca em contagens operacionais.
   async function overview(){
-    checkSession();
+    requireAdmin();
     const groups={
       geral:{title:'Visão geral',keywords:[]},
       pessoas:{title:'Pessoas',keywords:['pessoa','colaborador','equipe','funcao','treinamento','candidato','rh','admissao','cracha']},

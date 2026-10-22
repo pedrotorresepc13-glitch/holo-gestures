@@ -6,7 +6,7 @@ host.innerHTML=[
 '<button id="hc-launch" class="hc-launch" type="button" aria-expanded="false"><span class="hc-orb">✦</span><span>HOLO <small>Assistente</small></span></button>',
 '<section id="hc-panel" class="hc-panel" hidden aria-label="Conversa com HOLO">',
 '<header class="hc-header"><span class="hc-orb" id="hc-orb">✦</span><span><strong>HOLO · Assistente empresarial</strong><small id="hc-status">Verificando serviço local...</small></span><button id="hc-min" aria-label="Minimizar" type="button">−</button></header>',
-'<div id="hc-feed" class="hc-feed" role="log" aria-live="polite"><p class="hc-line">Sou a HOLO. Posso consultar o conhecimento catalogado no POSSEBON Brain da unidade autorizada e navegar pelo mapa. Pergunte sobre regras, módulos e processos.</p></div>',
+'<div id="hc-feed" class="hc-feed" role="log" aria-live="polite"><p class="hc-line">Posso consultar o conhecimento catalogado no POSSEBON Brain da unidade autorizada e navegar pelo mapa. Pergunte sobre regras, módulos e processos.</p></div>',
 '<form id="hc-form" class="hc-form"><input id="hc-input" maxlength="2000" placeholder="Pergunte sobre a empresa..." autocomplete="off" required aria-label="Digite sua pergunta"><button type="submit" id="hc-send" aria-label="Enviar">➜</button></form>',
 '<div class="hc-tools"><button id="hc-mic" type="button">🎙 Falar</button><button id="hc-voice" type="button" aria-pressed="true">🔊 Voz ativa</button><button id="hc-auto" type="button" aria-pressed="false">↻ Contínua</button><button id="hc-docs" type="button">▣ Arquivos</button></div>',
 '<p class="hc-foot" id="hc-foot">A voz do navegador pode utilizar serviços externos. Não compartilhe dados confidenciais sem verificar a configuração.</p>',
@@ -48,7 +48,7 @@ async function health(){
       (h.ollamaConnected===false?' · Ollama desligado':''));
     $('hc-foot').textContent='Modelo: '+h.model+' · Memória: '+h.historyCount+' mensagens, '+h.notesCount+' notas. Voz depende do navegador.';
     const history=await json('/api/history');
-    if(history.history?.length){$('hc-feed').replaceChildren();for(const entry of history.history)line(entry.text,entry.role);}
+    // Histórico completo fica fora da tela de consultas; respostas aparecem no quadro branco.
   }catch{alive=false;status('Servidor local indisponível');$('hc-foot').textContent='Abra o HOLO instalado no Windows para conectar a IA. A prévia na Vercel não executa modelos locais.';}
 }
 async function ask(message){
@@ -63,8 +63,11 @@ async function ask(message){
   const demoMode=document.querySelector('#data-badge')?.textContent==='DADOS DEMONSTRATIVOS';
   try{
     const response=await json('/api/chat',{method:'POST',body:JSON.stringify({message,area,navigation,demoMode})});
-    line(response.answer);status('IA '+response.provider+' · Brain '+(response.brain||'não consultado'));
-    if(response.sources?.length)line('Fontes: '+response.sources.slice(0,5).join('; '));
+    window.dispatchEvent(new CustomEvent('holo:answer',{detail:{
+      question:message,answer:response.answer,sources:response.sources||[],visual:response.visual||null
+    }}));
+    line('Resposta organizada no quadro branco'+(response.visual?.type==='metrics'?' com indicadores verificados.':'.'));
+    status('Consulta '+response.provider+' · '+(response.sources?.length?'Fonte identificada':'Sem fonte operacional'));
     busy=false;say(response.answer);
   }catch(e){line('Não consegui responder: '+e.message);status('IA indisponível');busy=false;resumeMic();}
   finally{$('hc-send').disabled=false;}
@@ -112,6 +115,17 @@ window.addEventListener('holo:assistant-notice',event=>{
 window.addEventListener('holo:ask',event=>{
   const message=String(event.detail?.message||'').trim();
   if(message){window.dispatchEvent(new Event('holo:chat-open'));void ask(message);}
+});
+window.addEventListener('holo:name-changed',event=>{
+  const name=String(event.detail?.name||'HOLO');
+  host.querySelector('.hc-header strong').textContent=name+' · Assistente empresarial';
+  host.querySelector('#hc-launch span:nth-child(2)').firstChild.textContent=name+' ';
+});
+window.addEventListener('holo:auth-changed',event=>{
+  if(!event.detail?.connected){
+    stopMic();if('speechSynthesis'in window)speechSynthesis.cancel();
+    $('hc-feed').replaceChildren();line('Entre com seu usuário POSSEBON para realizar consultas.');
+  }else void health();
 });
 window.addEventListener('pagehide',()=>{stopMic();if('speechSynthesis'in window)speechSynthesis.cancel();});
 void health();
